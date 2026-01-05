@@ -60,7 +60,7 @@ check_root() {
 }
 
 check_dependencies() {
-    local deps="parted partclone.ext4 partclone.ntfs partclone.fat32 partclone.ext3 partclone.ext2 pigz pv sgdisk gdisk"
+    local deps="parted partclone.ext4 partclone.ntfs partclone.fat32 partclone.ext3 partclone.ext2 pigz pv sgdisk gdisk efibootmgr"
     local missing=""
 
     for dep in $deps; do
@@ -71,7 +71,7 @@ check_dependencies() {
 
     if [ -n "$missing" ]; then
         log_error "Missing dependencies:$missing"
-        log_info "Install with: sudo apt-get install parted partclone pigz pv gdisk"
+        log_info "Install with: sudo apt-get install parted partclone pigz pv gdisk efibootmgr"
         exit 1
     fi
 }
@@ -106,6 +106,131 @@ detect_boot_mode() {
 }
 
 ################################################################################
+# WINDOWS DETECTION FUNCTIONS
+################################################################################
+has_windows_partition() {
+    local disk=$1
+    local partitions=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep -v "^${disk}$")
+
+    while read -r part_name fs_type; do
+        local partition="/dev/$part_name"
+
+        # Check if NTFS partition
+        if [ "$fs_type" = "ntfs" ]; then
+            # Mount temporarily to check for Windows
+            local temp_mount="/tmp/cyc-check-$$"
+            mkdir -p "$temp_mount"
+
+            if mount -o ro "$partition" "$temp_mount" 2>/dev/null; then
+                # Check for Windows directories
+                if [ -d "$temp_mount/Windows" ] || [ -d "$temp_mount/WINDOWS" ] || \
+                   [ -f "$temp_mount/bootmgr" ] || [ -f "$temp_mount/BOOTMGR" ]; then
+                    umount "$temp_mount"
+                    rmdir "$temp_mount"
+                    return 0
+                fi
+                umount "$temp_mount"
+            fi
+            rmdir "$temp_mount"
+        fi
+    done <<< "$partitions"
+
+    return 1
+}
+
+has_linux_partition() {
+    local disk=$1
+    local partitions=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep -v "^${disk}$")
+
+    while read -r part_name fs_type; do
+        if [[ "$fs_type" =~ ^ext[2-4]$ ]] || [ "$fs_type" = "xfs" ] || [ "$fs_type" = "btrfs" ]; then
+            return 0
+        fi
+    done <<< "$partitions"
+
+    return 1
+}
+
+detect_os_type() {
+    local disk=$1
+    local has_windows=false
+    local has_linux=false
+
+    if has_windows_partition "$disk"; then
+        has_windows=true
+    fi
+
+    if has_linux_partition "$disk"; then
+        has_linux=true
+    fi
+
+    if $has_windows && $has_linux; then
+        echo "MIXED"
+    elif $has_windows; then
+        echo "WINDOWS"
+    elif $has_linux; then
+        echo "LINUX"
+    else
+        echo "UNKNOWN"
+    fi
+}
+
+find_efi_partition() {
+    local disk=$1
+    local efi_part=$(lsblk -ln -o NAME,FSTYPE,PARTTYPE "/dev/$disk" | \
+                     grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b\|vfat" | \
+                     head -1 | awk '{print $1}')
+
+    if [ -n "$efi_part" ]; then
+        echo "/dev/$efi_part"
+    else
+        # Fallback: find first vfat partition
+        efi_part=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep vfat | head -1 | awk '{print $1}')
+        if [ -n "$efi_part" ]; then
+            echo "/dev/$efi_part"
+        fi
+    fi
+}
+
+find_windows_partition() {
+    local disk=$1
+    local partitions=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep -v "^${disk}$")
+
+    while read -r part_name fs_type; do
+        local partition="/dev/$part_name"
+
+        if [ "$fs_type" = "ntfs" ]; then
+            local temp_mount="/tmp/cyc-check-$$"
+            mkdir -p "$temp_mount"
+
+            if mount -o ro "$partition" "$temp_mount" 2>/dev/null; then
+                if [ -d "$temp_mount/Windows" ] || [ -d "$temp_mount/WINDOWS" ]; then
+                    umount "$temp_mount"
+                    rmdir "$temp_mount"
+                    echo "$partition"
+                    return 0
+                fi
+                umount "$temp_mount"
+            fi
+            rmdir "$temp_mount"
+        fi
+    done <<< "$partitions"
+}
+
+find_linux_root_partition() {
+    local disk=$1
+
+    # Try to find root partition (usually largest ext4)
+    local root_part=$(lsblk -ln -o NAME,FSTYPE,SIZE "/dev/$disk" | \
+                      grep -E "ext[2-4]|xfs|btrfs" | \
+                      sort -k3 -hr | head -1 | awk '{print $1}')
+
+    if [ -n "$root_part" ]; then
+        echo "/dev/$root_part"
+    fi
+}
+
+################################################################################
 # PARTITION BACKUP FUNCTIONS
 ################################################################################
 backup_partition_table() {
@@ -117,6 +242,9 @@ backup_partition_table() {
     # Backup MBR/GPT
     sgdisk --backup="$backup_path/partition-table.sgdisk" "/dev/$source_disk" 2>/dev/null
     sfdisk -d "/dev/$source_disk" > "$backup_path/partition-table.sfdisk" 2>/dev/null
+
+    # Backup MBR boot code (first 446 bytes) for Windows BIOS systems
+    dd if="/dev/$source_disk" of="$backup_path/mbr-backup.bin" bs=446 count=1 2>/dev/null
 
     # Save disk geometry
     parted -s "/dev/$source_disk" print > "$backup_path/disk-geometry.txt"
@@ -283,6 +411,118 @@ restore_partition() {
     log_success "Partition $partition restored"
 }
 
+################################################################################
+# WINDOWS BOOTLOADER INSTALLATION
+################################################################################
+install_windows_bootloader_uefi() {
+    local target_disk=$1
+    local backup_path=$2
+
+    log_info "Installing Windows UEFI bootloader on $target_disk..."
+
+    local efi_part=$(find_efi_partition "$target_disk")
+    local win_part=$(find_windows_partition "$target_disk")
+
+    if [ -z "$efi_part" ] || [ -z "$win_part" ]; then
+        log_error "Could not find EFI or Windows partition"
+        return 1
+    fi
+
+    # Mount EFI partition
+    local efi_mount="/mnt/cyc-efi-$$"
+    mkdir -p "$efi_mount"
+    mount "$efi_part" "$efi_mount" || {
+        log_error "Failed to mount EFI partition"
+        rmdir "$efi_mount"
+        return 1
+    }
+
+    # Mount Windows partition
+    local win_mount="/mnt/cyc-win-$$"
+    mkdir -p "$win_mount"
+    mount "$win_part" "$win_mount" || {
+        log_error "Failed to mount Windows partition"
+        umount "$efi_mount"
+        rmdir "$efi_mount" "$win_mount"
+        return 1
+    }
+
+    # Check if Windows Boot Manager exists in Windows partition
+    if [ -d "$win_mount/Windows/Boot" ]; then
+        log_info "Found Windows Boot Manager, copying to EFI partition..."
+
+        # Create EFI/Microsoft/Boot directory
+        mkdir -p "$efi_mount/EFI/Microsoft/Boot"
+
+        # Copy bootmgfw.efi and BCD
+        if [ -f "$win_mount/Windows/Boot/EFI/bootmgfw.efi" ]; then
+            cp "$win_mount/Windows/Boot/EFI/bootmgfw.efi" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+        fi
+
+        if [ -d "$win_mount/Windows/Boot/EFI" ]; then
+            cp -r "$win_mount/Windows/Boot/EFI/"* "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+        fi
+
+        # Copy BCD store
+        if [ -f "$win_mount/Windows/Boot/BCD" ]; then
+            cp "$win_mount/Windows/Boot/BCD" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+        fi
+    elif [ -d "$efi_mount/EFI/Microsoft" ]; then
+        log_info "Windows bootloader already exists in EFI partition"
+    else
+        log_warning "Could not find Windows Boot Manager files"
+    fi
+
+    # Add EFI boot entry
+    local disk_num=$(echo "$target_disk" | sed 's/[^0-9]*//g')
+    local efi_part_num=$(echo "$efi_part" | sed 's/.*[^0-9]\([0-9]\+\)$/\1/')
+
+    efibootmgr -c -d "/dev/$target_disk" -p "$efi_part_num" \
+               -L "Windows Boot Manager" \
+               -l "\\EFI\\Microsoft\\Boot\\bootmgfw.efi" 2>/dev/null || {
+        log_warning "Could not create EFI boot entry (efibootmgr may not work in chroot)"
+    }
+
+    # Cleanup
+    umount "$win_mount" "$efi_mount"
+    rmdir "$win_mount" "$efi_mount"
+
+    log_success "Windows UEFI bootloader installed"
+}
+
+install_windows_bootloader_bios() {
+    local target_disk=$1
+    local backup_path=$2
+
+    log_info "Installing Windows BIOS bootloader on $target_disk..."
+
+    local win_part=$(find_windows_partition "$target_disk")
+
+    if [ -z "$win_part" ]; then
+        log_error "Could not find Windows partition"
+        return 1
+    fi
+
+    # For BIOS, the bootloader should already be in the partition
+    # We just need to write the MBR boot code
+    log_info "Writing Windows MBR boot code..."
+
+    # Check if we have a backup of MBR
+    if [ -f "$backup_path/mbr-backup.bin" ]; then
+        dd if="$backup_path/mbr-backup.bin" of="/dev/$target_disk" bs=446 count=1 2>/dev/null || {
+            log_warning "Could not restore MBR from backup"
+        }
+    else
+        log_warning "No MBR backup found - Windows may not boot"
+        log_info "You may need to run 'bootrec /fixmbr' and 'bootrec /fixboot' from Windows Recovery"
+    fi
+
+    log_success "Windows BIOS bootloader installation attempted"
+}
+
+################################################################################
+# GRUB INSTALLATION
+################################################################################
 install_grub() {
     local target_disk=$1
     local backup_path=$2
@@ -295,25 +535,26 @@ install_grub() {
     mkdir -p "$mount_point"
 
     # Find root partition (usually the largest ext4)
-    local root_part=$(lsblk -ln -o NAME,FSTYPE,SIZE "/dev/$target_disk" | grep ext4 | sort -k3 -hr | head -1 | awk '{print $1}')
+    local root_part=$(find_linux_root_partition "$target_disk")
 
     if [ -z "$root_part" ]; then
-        log_warning "Could not find root partition, trying first partition..."
-        root_part=$(lsblk -ln -o NAME "/dev/$target_disk" | grep -v "^${target_disk}$" | head -1)
+        log_warning "Could not find Linux root partition"
+        rmdir "$mount_point"
+        return 1
     fi
 
-    mount "/dev/$root_part" "$mount_point" 2>/dev/null || {
-        log_warning "Could not mount /dev/$root_part, skipping GRUB installation"
+    mount "$root_part" "$mount_point" 2>/dev/null || {
+        log_warning "Could not mount $root_part, skipping GRUB installation"
         rmdir "$mount_point"
         return 1
     }
 
     # Mount EFI partition if UEFI
     if [ "$boot_mode" = "UEFI" ]; then
-        local efi_part=$(lsblk -ln -o NAME,FSTYPE "/dev/$target_disk" | grep -i vfat | head -1 | awk '{print $1}')
+        local efi_part=$(find_efi_partition "$target_disk")
         if [ -n "$efi_part" ]; then
             mkdir -p "$mount_point/boot/efi"
-            mount "/dev/$efi_part" "$mount_point/boot/efi" 2>/dev/null || true
+            mount "$efi_part" "$mount_point/boot/efi" 2>/dev/null || true
         fi
     fi
 
@@ -336,10 +577,18 @@ install_grub() {
         }
     fi
 
-    # Update GRUB configuration
+    # Update GRUB configuration (will detect Windows if present)
     chroot "$mount_point" update-grub 2>/dev/null || {
         chroot "$mount_point" grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true
     }
+
+    # For mixed systems, ensure os-prober is enabled
+    if [ -f "$mount_point/etc/default/grub" ]; then
+        if ! grep -q "GRUB_DISABLE_OS_PROBER=false" "$mount_point/etc/default/grub"; then
+            echo "GRUB_DISABLE_OS_PROBER=false" >> "$mount_point/etc/default/grub"
+            chroot "$mount_point" update-grub 2>/dev/null || true
+        fi
+    fi
 
     # Cleanup
     for dir in dev/pts dev proc sys boot/efi; do
@@ -349,6 +598,48 @@ install_grub() {
     rmdir "$mount_point"
 
     log_success "GRUB installed on $target_disk"
+}
+
+################################################################################
+# SMART BOOTLOADER INSTALLATION
+################################################################################
+install_bootloader() {
+    local target_disk=$1
+    local backup_path=$2
+
+    log_info "Detecting OS type on $target_disk..."
+    local os_type=$(detect_os_type "$target_disk")
+    local boot_mode=$(detect_boot_mode)
+
+    log_info "Detected OS type: $os_type"
+
+    case "$os_type" in
+        WINDOWS)
+            log_info "Installing Windows-only bootloader..."
+            if [ "$boot_mode" = "UEFI" ]; then
+                install_windows_bootloader_uefi "$target_disk" "$backup_path"
+            else
+                install_windows_bootloader_bios "$target_disk" "$backup_path"
+            fi
+            ;;
+        LINUX)
+            log_info "Installing Linux-only bootloader (GRUB)..."
+            install_grub "$target_disk" "$backup_path"
+            ;;
+        MIXED)
+            log_info "Installing bootloader for dual-boot system..."
+            # For mixed systems, install GRUB which will detect Windows
+            install_grub "$target_disk" "$backup_path"
+            # Also ensure Windows bootloader is present in EFI partition
+            if [ "$boot_mode" = "UEFI" ]; then
+                install_windows_bootloader_uefi "$target_disk" "$backup_path"
+            fi
+            ;;
+        *)
+            log_warning "Could not detect OS type, attempting GRUB installation..."
+            install_grub "$target_disk" "$backup_path"
+            ;;
+    esac
 }
 
 restore_to_disk() {
@@ -403,8 +694,8 @@ restore_to_disk() {
         restore_partition "/dev/$target_part" "$partition_img"
     done
 
-    # Install GRUB
-    install_grub "$target_disk" "$backup_path"
+    # Install bootloader (automatically detects OS type)
+    install_bootloader "$target_disk" "$backup_path"
 
     log_success "=== DISK RESTORE COMPLETED for $target_disk ==="
 }
