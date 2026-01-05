@@ -17,7 +17,7 @@ Profesjonalne narzędzie do klonowania dysków na Ubuntu, działające na poziom
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y parted partclone pigz pv gdisk lsblk util-linux
+sudo apt-get install -y parted partclone pigz pv gdisk efibootmgr lsblk util-linux
 ```
 
 ### Dodatkowe pakiety partclone:
@@ -77,6 +77,7 @@ sudo ./cyc-cloner.sh
 
 **Co się zapisuje:**
 - Tabela partycji (GPT/MBR)
+- MBR boot code (dla Windows BIOS)
 - Wszystkie partycje jako skompresowane obrazy
 - Metadane (typ bootu, liczba partycji, daty)
 - Informacje o systemach plików
@@ -87,7 +88,10 @@ sudo ./cyc-cloner.sh
 2. Wybierz backup z listy
 3. Wybierz dysk docelowy (np. `sdb`)
 4. Potwierdź wpisując `YES`
-5. Dysk zostanie sklonowany 1:1 z automatyczną instalacją GRUB
+5. Dysk zostanie sklonowany 1:1 z automatyczną instalacją bootloadera:
+   - **Tylko Windows**: Instaluje Windows Boot Manager (UEFI) lub bootmgr (BIOS)
+   - **Tylko Linux**: Instaluje GRUB
+   - **Dual boot (mieszaniec)**: Instaluje GRUB + Windows bootloader, GRUB wykrywa oba systemy
 
 ### Scenariusz 3: Klonowanie na 8 dysków równolegle
 
@@ -103,6 +107,7 @@ sudo ./cyc-cloner.sh
 /mnt/backups/disk-images/sda_20260105_143022/
 ├── partition-table.sgdisk      # Backup GPT
 ├── partition-table.sfdisk      # Backup MBR
+├── mbr-backup.bin              # MBR boot code (446 bajtów)
 ├── disk-geometry.txt           # Geometria dysku
 ├── metadata.txt                # Metadane backupu
 ├── partition_1.img.gz          # Partycja 1 (skompresowana)
@@ -138,10 +143,12 @@ Dysk z:
 ### Tylko Windows
 
 Dysk z:
-- EFI/System Reserved
+- EFI/System Reserved (UEFI) lub System Reserved (BIOS)
 - Windows (NTFS)
 
-**Wynik:** Bootowalna kopia Windows (wymaga dodatkowego `bootmgr` w UEFI).
+**Wynik:** Pełna bootowalna kopia Windows:
+- **UEFI**: Automatycznie kopiuje Windows Boot Manager do partycji EFI i tworzy wpis w NVRAM
+- **BIOS**: Przywraca MBR boot code i bootmgr z backupu
 
 ### Mieszane partycje
 
@@ -154,7 +161,7 @@ Dysk z:
 ### Backup (Clone to Files)
 
 1. **Skanowanie dysku**: Wykrywa wszystkie partycje
-2. **Backup tabeli partycji**: Zapisuje GPT/MBR
+2. **Backup tabeli partycji**: Zapisuje GPT/MBR + MBR boot code
 3. **Dla każdej partycji**:
    - Wykrywa typ systemu plików (ext4, NTFS, FAT32, etc.)
    - Używa `partclone` do skopiowania tylko zajętych bloków
@@ -170,11 +177,17 @@ Dysk z:
    - Dekompresuje obraz
    - Używa `partclone` do przywrócenia danych
    - Odtwarza UUIDs i metadane
-4. **Instalacja GRUB**:
+4. **Inteligentna instalacja bootloadera**:
+   - Wykrywa typ OS na dysku (Windows/Linux/Mixed)
    - Wykrywa tryb boot (BIOS/UEFI)
-   - Instaluje GRUB na dysk
-   - Generuje konfigurację GRUB
-   - Wykrywa wszystkie systemy operacyjne
+   - **Dla Windows only**:
+     - UEFI: Kopiuje Windows Boot Manager do partycji EFI, tworzy wpis efibootmgr
+     - BIOS: Przywraca MBR boot code z backupu
+   - **Dla Linux only**:
+     - Instaluje GRUB (BIOS lub UEFI)
+   - **Dla dual boot**:
+     - Instaluje GRUB który wykrywa oba systemy (os-prober)
+     - Zapewnia obecność Windows bootloadera w EFI partition
 
 ### Parallel Restore (Multiple Disks)
 
@@ -206,7 +219,7 @@ Format logów:
 ### Problem: "Missing dependencies"
 
 ```bash
-sudo apt-get install parted partclone pigz pv gdisk
+sudo apt-get install parted partclone pigz pv gdisk efibootmgr
 ```
 
 ### Problem: "Partition is mounted"
@@ -218,11 +231,17 @@ sudo umount /dev/sdX2
 sudo swapoff /dev/sdX3  # dla swap
 ```
 
-### Problem: "GRUB installation failed"
+### Problem: "GRUB installation failed" lub "Bootloader installation failed"
 
+**Dla Linux/GRUB:**
 - Sprawdź czy dysk ma poprawną tabelę partycji
 - Dla UEFI: upewnij się że istnieje partycja EFI (FAT32, typ `EF00`)
 - Dla BIOS: upewnij się że jest wolne miejsce na początku dysku (1-2 MB)
+
+**Dla Windows:**
+- UEFI: Sprawdź czy partycja Windows zawiera folder `Windows/Boot/EFI`
+- BIOS: Skrypt informuje jeśli nie ma backupu MBR - uruchom `bootrec /fixmbr` i `bootrec /fixboot` z Windows Recovery
+- Sprawdź logi w `/var/log/cyc-cloner.log` dla szczegółów
 
 ### Problem: Backup zajmuje za dużo miejsca
 
