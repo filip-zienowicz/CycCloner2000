@@ -59,6 +59,35 @@ log_debug() {
 ################################################################################
 # UTILITY FUNCTIONS
 ################################################################################
+refresh_disk_list() {
+    log_debug "Refreshing disk list (hot-swap support)..."
+
+    # Force kernel to rescan all SCSI/SATA buses
+    if [ -d /sys/class/scsi_host ]; then
+        for host in /sys/class/scsi_host/host*; do
+            if [ -f "$host/scan" ]; then
+                echo "- - -" > "$host/scan" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # Rescan block devices
+    if command -v partprobe &> /dev/null; then
+        partprobe 2>/dev/null || true
+    fi
+
+    # Give kernel time to detect new devices
+    sleep 1
+
+    # Trigger udev
+    if command -v udevadm &> /dev/null; then
+        udevadm trigger --subsystem-match=block 2>/dev/null || true
+        udevadm settle 2>/dev/null || true
+    fi
+
+    log_debug "Disk refresh completed"
+}
+
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         log_error "This script must be run as root (sudo)"
@@ -84,6 +113,7 @@ check_dependencies() {
 }
 
 list_disks() {
+    refresh_disk_list
     log_info "Available disks:"
     lsblk -d -o NAME,SIZE,MODEL,TYPE | grep disk
     echo ""
@@ -310,21 +340,21 @@ backup_partition() {
     case "$fs_type" in
         ext2|ext3|ext4)
             log_debug "Using partclone.ext4"
-            if ! partclone.ext4 -c -s "$partition" 2>&1 | pigz -c > "$output_file"; then
+            if ! partclone.ext4 -c -s "$partition" 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
                 log_error "Failed to backup $partition"
                 return 1
             fi
             ;;
         ntfs)
             log_debug "Using partclone.ntfs"
-            if ! partclone.ntfs -c -s "$partition" 2>&1 | pigz -c > "$output_file"; then
+            if ! partclone.ntfs -c -s "$partition" 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
                 log_error "Failed to backup $partition"
                 return 1
             fi
             ;;
         vfat|fat32|fat16)
             log_debug "Using partclone.vfat"
-            if ! partclone.vfat -c -s "$partition" 2>&1 | pigz -c > "$output_file"; then
+            if ! partclone.vfat -c -s "$partition" 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
                 log_error "Failed to backup $partition"
                 return 1
             fi
@@ -336,14 +366,14 @@ backup_partition() {
             ;;
         "")
             log_warning "No filesystem detected on $partition, using dd backup..."
-            if ! dd if="$partition" bs=4M status=progress 2>&1 | pigz -c > "$output_file"; then
+            if ! dd if="$partition" bs=4M status=progress 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
                 log_error "Failed to backup $partition with dd"
                 return 1
             fi
             ;;
         *)
             log_warning "Unknown filesystem $fs_type, using dd backup..."
-            if ! dd if="$partition" bs=4M status=progress 2>&1 | pigz -c > "$output_file"; then
+            if ! dd if="$partition" bs=4M status=progress 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
                 log_error "Failed to backup $partition with dd"
                 return 1
             fi
@@ -439,6 +469,9 @@ EOF
         log_error "Check log file: $LOG_FILE"
     fi
 
+    # Refresh disk list for hot-swap
+    refresh_disk_list
+
     echo "$backup_path"
 }
 
@@ -451,14 +484,29 @@ restore_partition_table() {
 
     log_info "Restoring partition table to $target_disk..."
 
-    # Wipe existing partition table
+    # Wipe existing partition table thoroughly
     log_debug "Wiping existing partition table..."
-    sgdisk --zap-all "/dev/$target_disk" 2>/dev/null || true
-    
-    # Additional wipe for stubborn disks
-    dd if=/dev/zero of="/dev/$target_disk" bs=512 count=1 2>/dev/null || true
 
-    sleep 2
+    # Get disk size in sectors
+    local disk_size_sectors=$(blockdev --getsz "/dev/$target_disk" 2>/dev/null)
+
+    # Wipe with sgdisk (clears GPT)
+    sgdisk --zap-all "/dev/$target_disk" 2>/dev/null || true
+
+    # Wipe beginning of disk (MBR + GPT primary)
+    dd if=/dev/zero of="/dev/$target_disk" bs=1M count=10 2>/dev/null || true
+
+    # Wipe end of disk (GPT backup) if we know disk size
+    if [ -n "$disk_size_sectors" ] && [ "$disk_size_sectors" -gt 0 ]; then
+        # Wipe last 10MB where GPT backup resides
+        dd if=/dev/zero of="/dev/$target_disk" bs=1M seek=$((disk_size_sectors / 2048 - 10)) count=10 2>/dev/null || true
+    fi
+
+    # Force kernel to re-read empty partition table
+    partprobe "/dev/$target_disk" 2>/dev/null || true
+    blockdev --rereadpt "/dev/$target_disk" 2>/dev/null || true
+
+    sleep 3
 
     # Restore GPT
     if [ -f "$backup_path/partition-table.sgdisk" ]; then
@@ -531,12 +579,11 @@ restore_partition() {
     fi
 
     log_debug "Starting restore operation..."
-    
+
     case "$fs_type" in
         ext2|ext3|ext4)
-            log_debug "Command: pigz -dc $input_file | partclone.ext4 -r -o $partition"
-            if pigz -dc "$input_file" 2>&1 | pv -pterb -N "Decompressing" 2>&1 | \
-               partclone.ext4 -r -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
+            log_debug "Command: pigz -dc $input_file | partclone.ext4 -r -d -o $partition"
+            if pigz -dc "$input_file" | partclone.ext4 -r -d -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "Successfully restored ext partition"
             else
                 log_error "Failed to restore ext partition"
@@ -544,9 +591,8 @@ restore_partition() {
             fi
             ;;
         ntfs)
-            log_debug "Command: pigz -dc $input_file | partclone.ntfs -r -o $partition"
-            if pigz -dc "$input_file" 2>&1 | pv -pterb -N "Decompressing" 2>&1 | \
-               partclone.ntfs -r -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
+            log_debug "Command: pigz -dc $input_file | partclone.ntfs -r -d -o $partition"
+            if pigz -dc "$input_file" | partclone.ntfs -r -d -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "Successfully restored NTFS partition"
             else
                 log_error "Failed to restore NTFS partition"
@@ -554,9 +600,8 @@ restore_partition() {
             fi
             ;;
         vfat|fat32|fat16)
-            log_debug "Command: pigz -dc $input_file | partclone.vfat -r -o $partition"
-            if pigz -dc "$input_file" 2>&1 | pv -pterb -N "Decompressing" 2>&1 | \
-               partclone.vfat -r -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
+            log_debug "Command: pigz -dc $input_file | partclone.vfat -r -d -o $partition"
+            if pigz -dc "$input_file" | partclone.vfat -r -d -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "Successfully restored FAT partition"
             else
                 log_error "Failed to restore FAT partition"
@@ -565,8 +610,7 @@ restore_partition() {
             ;;
         "")
             log_info "No filesystem type stored, using dd restore..."
-            if pigz -dc "$input_file" 2>&1 | pv -pterb -N "Restoring" | \
-               dd of="$partition" bs=4M 2>&1 | tee -a "$LOG_FILE"; then
+            if pigz -dc "$input_file" | dd of="$partition" bs=4M status=progress 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "Successfully restored with dd"
             else
                 log_error "Failed to restore with dd"
@@ -575,8 +619,7 @@ restore_partition() {
             ;;
         *)
             log_info "Unknown filesystem type, using dd restore..."
-            if pigz -dc "$input_file" 2>&1 | pv -pterb -N "Restoring" | \
-               dd of="$partition" bs=4M 2>&1 | tee -a "$LOG_FILE"; then
+            if pigz -dc "$input_file" | dd of="$partition" bs=4M status=progress 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "Successfully restored with dd"
             else
                 log_error "Failed to restore with dd"
@@ -927,6 +970,9 @@ restore_to_disk() {
     log_info "Installing bootloader..."
     install_bootloader "$target_disk" "$backup_path"
 
+    # Refresh disk list for hot-swap
+    refresh_disk_list
+
     log_success "=== DISK RESTORE COMPLETED for $target_disk ==="
     return 0
 }
@@ -994,6 +1040,9 @@ restore_to_multiple_disks() {
 
     log_info "Restore summary: $completed succeeded, $failed failed"
 
+    # Refresh disk list for hot-swap
+    refresh_disk_list
+
     if [ $failed -eq 0 ]; then
         log_success "=== ALL DISK RESTORES COMPLETED SUCCESSFULLY ==="
         return 0
@@ -1007,10 +1056,14 @@ restore_to_multiple_disks() {
 # INTERACTIVE MENU
 ################################################################################
 show_menu() {
+    # Refresh disk list before showing menu (hot-swap support)
+    refresh_disk_list
+
     echo ""
     echo "=========================================="
     echo "    CycCloner2000 - Disk Cloning Tool"
     echo "=========================================="
+    echo -e "${CYAN}[Hot-Swap Ready]${NC} Disks refreshed automatically"
     echo ""
     echo "1) Clone disk to files"
     echo "2) Restore to single disk"
