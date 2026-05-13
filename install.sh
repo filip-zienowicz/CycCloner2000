@@ -9,6 +9,8 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 INSTALL_PACKAGES=true
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_TARGET="${CONFIG_TARGET:-/etc/cyccloner2000.conf}"
 if [ "${1:-}" = "--no-packages" ]; then
     INSTALL_PACKAGES=false
 fi
@@ -73,6 +75,16 @@ echo "[2/6] Creating config backups..."
 cp -n /etc/security/limits.conf "/etc/security/limits.conf.backup.$STAMP" 2>/dev/null || true
 cp -n /etc/systemd/logind.conf "/etc/systemd/logind.conf.backup.$STAMP" 2>/dev/null || true
 cp -n /etc/sysctl.conf "/etc/sysctl.conf.backup.$STAMP" 2>/dev/null || true
+
+if [ -f "$SCRIPT_DIR/cyccloner.conf" ]; then
+    if [ -f "$CONFIG_TARGET" ]; then
+        cp -n "$CONFIG_TARGET" "$CONFIG_TARGET.backup.$STAMP" 2>/dev/null || true
+        echo "[INFO] Existing $CONFIG_TARGET kept in place"
+    else
+        cp "$SCRIPT_DIR/cyccloner.conf" "$CONFIG_TARGET"
+        echo "[INFO] Installed default config to $CONFIG_TARGET"
+    fi
+fi
 
 echo "[3/6] Configuring /etc/security/limits.conf..."
 replace_block /etc/security/limits.conf "$LIMITS_BEGIN" "$LIMITS_END" "*    soft    nproc     8192
