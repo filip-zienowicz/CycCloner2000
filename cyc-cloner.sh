@@ -14,14 +14,39 @@ set -o pipefail
 ################################################################################
 
 # CONFIGURATION VARIABLES
-BACKUP_DIR="/root/images"
-LOG_FILE="/var/log/cyc-cloner.log"
-PARALLEL_JOBS=8
-COMPRESSION="pigz"  # pigz (fast parallel gzip) or gzip or none
-TIMEOUT_SECONDS=30  # Timeout for operations that might hang
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKUP_DIR="${BACKUP_DIR:-/root/images}"
+LOG_FILE="${LOG_FILE:-/var/log/cyc-cloner.log}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-8}"
+COMPRESSION="${COMPRESSION:-pigz}"  # pigz only for now
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-30}"
+AUTO_REFRESH_DISKS="${AUTO_REFRESH_DISKS:-true}"
+DEVICE_SETTLE_SECONDS="${DEVICE_SETTLE_SECONDS:-2}"
+PARTITION_TABLE_SETTLE_SECONDS="${PARTITION_TABLE_SETTLE_SECONDS:-5}"
 RANDOMIZE_GPT_GUIDS="${RANDOMIZE_GPT_GUIDS:-false}"
 CREATE_EFI_NVRAM_ENTRY="${CREATE_EFI_NVRAM_ENTRY:-false}"
 GRUB_BOOTLOADER_ID="${GRUB_BOOTLOADER_ID:-GRUB}"
+
+load_config() {
+    local config_files=()
+    local config_file
+
+    if [ -n "${CYC_CONFIG:-}" ]; then
+        config_files+=("$CYC_CONFIG")
+    else
+        config_files+=("/etc/cyccloner2000.conf")
+        config_files+=("$SCRIPT_DIR/cyccloner.conf")
+    fi
+
+    for config_file in "${config_files[@]}"; do
+        if [ -f "$config_file" ]; then
+            # shellcheck source=/dev/null
+            source "$config_file"
+        fi
+    done
+}
+
+load_config
 
 ################################################################################
 # COLOR CODES
@@ -64,6 +89,11 @@ log_debug() {
 # UTILITY FUNCTIONS
 ################################################################################
 refresh_disk_list() {
+    if [ "$AUTO_REFRESH_DISKS" != "true" ]; then
+        log_debug "Disk auto-refresh disabled by config"
+        return 0
+    fi
+
     log_debug "Refreshing disk list (hot-swap support)..."
 
     # Force kernel to rescan all SCSI/SATA buses
@@ -77,11 +107,12 @@ refresh_disk_list() {
 
     # Rescan block devices
     if command -v partprobe &> /dev/null; then
+        log_debug "Running partprobe for all block devices..."
         partprobe 2>/dev/null || true
     fi
 
     # Give kernel time to detect new devices
-    sleep 1
+    sleep "$DEVICE_SETTLE_SECONDS"
 
     # Trigger udev
     if command -v udevadm &> /dev/null; then
@@ -90,6 +121,55 @@ refresh_disk_list() {
     fi
 
     log_debug "Disk refresh completed"
+}
+
+refresh_disk() {
+    local disk=$1
+    local disk_path
+    disk_path=$(disk_dev "$disk")
+
+    if [ "$AUTO_REFRESH_DISKS" != "true" ]; then
+        log_debug "Disk auto-refresh disabled by config"
+        return 0
+    fi
+
+    log_debug "Refreshing $disk_path..."
+
+    if [ -b "$disk_path" ]; then
+        partprobe "$disk_path" 2>/dev/null || true
+        blockdev --rereadpt "$disk_path" 2>/dev/null || true
+    fi
+
+    if command -v udevadm &> /dev/null; then
+        udevadm trigger --subsystem-match=block 2>/dev/null || true
+        udevadm settle 2>/dev/null || true
+    fi
+
+    sleep "$DEVICE_SETTLE_SECONDS"
+}
+
+wait_for_partitions() {
+    local disk=$1
+    local expected_count=${2:-1}
+    local attempts=${3:-10}
+    local count=0
+    local attempt
+
+    for attempt in $(seq 1 "$attempts"); do
+        refresh_disk "$disk"
+        count=$(list_disk_partitions "$disk" | wc -l | tr -d ' ')
+
+        if [ "$count" -ge "$expected_count" ]; then
+            log_debug "Detected $count partition(s) on $(disk_dev "$disk")"
+            return 0
+        fi
+
+        log_debug "Waiting for partitions on $(disk_dev "$disk") ($count/$expected_count)..."
+        sleep 1
+    done
+
+    log_warning "Expected $expected_count partition(s) on $(disk_dev "$disk"), detected $count"
+    return 1
 }
 
 check_root() {
@@ -544,6 +624,9 @@ clone_disk_to_files() {
     log_info "=== STARTING DISK CLONE ==="
     log_info "Source disk: $source_disk"
 
+    refresh_disk_list
+    refresh_disk "$source_disk"
+
     # Verify disk exists
     if [ ! -b "$source_path" ]; then
         log_error "Disk $source_path does not exist"
@@ -649,6 +732,7 @@ restore_partition_table() {
     target_path=$(disk_dev "$target_disk")
 
     log_info "Restoring partition table to $target_disk..."
+    refresh_disk "$target_disk"
 
     # Wipe existing partition table thoroughly
     log_debug "Wiping existing partition table..."
@@ -669,10 +753,9 @@ restore_partition_table() {
     fi
 
     # Force kernel to re-read empty partition table
-    partprobe "$target_path" 2>/dev/null || true
-    blockdev --rereadpt "$target_path" 2>/dev/null || true
+    refresh_disk "$target_disk"
 
-    sleep 3
+    sleep "$PARTITION_TABLE_SETTLE_SECONDS"
 
     # Restore GPT
     if [ -f "$backup_path/partition-table.sgdisk" ]; then
@@ -701,12 +784,8 @@ restore_partition_table() {
 
     # Inform kernel of partition changes
     log_debug "Informing kernel of partition changes..."
-    partprobe "$target_path" 2>&1 | tee -a "$LOG_FILE"
-    sleep 3
-    
-    # Force kernel to re-read partition table
-    blockdev --rereadpt "$target_path" 2>&1 | tee -a "$LOG_FILE"
-    sleep 2
+    refresh_disk "$target_disk"
+    sleep "$PARTITION_TABLE_SETTLE_SECONDS"
 
     log_success "Partition table restored"
     return 0
@@ -1103,6 +1182,9 @@ restore_to_disk() {
     log_info "Source: $backup_path"
     log_info "Target: $target_disk"
 
+    refresh_disk_list
+    refresh_disk "$target_disk"
+
     # Verify backup exists
     if [ ! -d "$backup_path" ]; then
         log_error "Backup directory $backup_path does not exist"
@@ -1144,6 +1226,7 @@ restore_to_disk() {
     # Restore each partition
     local failed=0
     local target_partitions
+    wait_for_partitions "$target_disk" "$partition_count" 12 || true
     target_partitions=$(list_disk_partitions "$target_disk")
 
     for i in $(seq 1 "$partition_count"); do
@@ -1212,6 +1295,8 @@ restore_to_multiple_disks() {
     log_info "Source: $backup_path"
     log_info "Targets: ${target_disks[*]}"
     log_info "Parallel jobs: ${#target_disks[@]}"
+
+    refresh_disk_list
 
     if [ ${#target_disks[@]} -eq 0 ]; then
         log_error "No target disks specified"
@@ -1504,9 +1589,14 @@ Examples:
   $0 restore-many sda_20260513_120000 sdb sdc sdd sde sdf
 
 Environment:
+  CYC_CONFIG=/path/to/conf         load an explicit config file
   RANDOMIZE_GPT_GUIDS=true        randomize GPT disk/partition GUIDs after restore
   CREATE_EFI_NVRAM_ENTRY=true     create EFI NVRAM entry on this host
   GRUB_BOOTLOADER_ID=GRUB         UEFI GRUB bootloader id
+
+Config files:
+  /etc/cyccloner2000.conf
+  $SCRIPT_DIR/cyccloner.conf
 EOF
 }
 
@@ -1526,6 +1616,7 @@ main() {
     mkdir -p "$BACKUP_DIR"
 
     # Create log file if it doesn't exist
+    mkdir -p "$(dirname "$LOG_FILE")"
     touch "$LOG_FILE"
 
     log_info "CycCloner2000 started"

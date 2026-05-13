@@ -12,6 +12,7 @@ Obslugiwane uklady:
 
 - `cyc-cloner.sh` - glowne narzedzie do clone/restore.
 - `install.sh` - instalacja zaleznosci i tuning hosta klonujacego.
+- `cyccloner.conf` - lokalna konfiguracja sciezek i zachowania skryptu.
 
 ## Instalacja hosta klonujacego
 
@@ -25,6 +26,28 @@ Installer uzywa nieinteraktywnych pakietow GRUB (`grub-efi-amd64-bin`, `grub-pc-
 sudo ./install.sh --no-packages
 ```
 
+Installer kopiuje domyslna konfiguracje do `/etc/cyccloner2000.conf`, jezeli ten plik jeszcze nie istnieje.
+
+## Konfiguracja
+
+Najwazniejsze ustawienie to katalog obrazow:
+
+```bash
+BACKUP_DIR="/root/images"
+```
+
+Mozesz zmienic je w:
+
+- `./cyccloner.conf` - konfiguracja obok skryptu,
+- `/etc/cyccloner2000.conf` - konfiguracja systemowa,
+- pliku podanym przez `CYC_CONFIG=/sciezka/do/pliku.conf`.
+
+Przykladowo:
+
+```bash
+sudo CYC_CONFIG=/mnt/clone/cyccloner.conf ./cyc-cloner.sh list-backups
+```
+
 ## Szybki workflow
 
 1. Przygotuj dysk wzorcowy i upewnij sie, ze bootuje.
@@ -34,25 +57,21 @@ sudo ./install.sh --no-packages
 sudo ./cyc-cloner.sh clone sda
 ```
 
-Obrazy trafiaja domyslnie do `/root/images`.
+Obrazy trafiaja do katalogu ustawionego w `BACKUP_DIR`.
 
-3. Po podlaczeniu dyskow docelowych odswiez tablice urzadzen:
-
-```bash
-sudo partprobe
-```
-
-4. Przywroc obraz na jeden dysk:
+3. Przywroc obraz na jeden dysk:
 
 ```bash
 sudo ./cyc-cloner.sh restore sda_20260513_120000 sdb
 ```
 
-5. Przywroc obraz na wiele dyskow rownolegle:
+4. Przywroc obraz na wiele dyskow rownolegle:
 
 ```bash
 sudo ./cyc-cloner.sh restore-many sda_20260513_120000 sdb sdc sdd sde sdf
 ```
+
+Nie trzeba osobno uruchamiac `partprobe`. Skrypt automatycznie robi rescan/partprobe/udev settle przed clone/restore oraz po odtworzeniu tablicy partycji.
 
 Mozesz podac pelna sciezke do obrazu zamiast samej nazwy katalogu.
 
