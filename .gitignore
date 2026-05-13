@@ -1,0 +1,13 @@
+.DS_Store
+*.log
+*.tmp
+*.bak
+*.backup
+
+# Local test images / cloned backup payloads
+images/
+*.img
+*.img.gz
+*.sgdisk
+*.sfdisk
+mbr-backup.bin
