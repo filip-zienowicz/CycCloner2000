@@ -1,4 +1,5 @@
 #!/bin/bash
+set -o pipefail
 
 ################################################################################
 # CycCloner2000 - Advanced Disk Cloning Tool
@@ -18,6 +19,9 @@ LOG_FILE="/var/log/cyc-cloner.log"
 PARALLEL_JOBS=8
 COMPRESSION="pigz"  # pigz (fast parallel gzip) or gzip or none
 TIMEOUT_SECONDS=30  # Timeout for operations that might hang
+RANDOMIZE_GPT_GUIDS="${RANDOMIZE_GPT_GUIDS:-false}"
+CREATE_EFI_NVRAM_ENTRY="${CREATE_EFI_NVRAM_ENTRY:-false}"
+GRUB_BOOTLOADER_ID="${GRUB_BOOTLOADER_ID:-GRUB}"
 
 ################################################################################
 # COLOR CODES
@@ -96,7 +100,7 @@ check_root() {
 }
 
 check_dependencies() {
-    local deps="parted partclone.ext4 partclone.ntfs partclone.fat32 partclone.ext3 partclone.ext2 pigz pv sgdisk gdisk efibootmgr ntfs-3g"
+    local deps="awk blkid blockdev dd findmnt lsblk mount partprobe parted pigz sfdisk sgdisk sort tee timeout umount"
     local missing=""
 
     for dep in $deps; do
@@ -105,32 +109,112 @@ check_dependencies() {
         fi
     done
 
+    local partclone_deps="partclone.ext4 partclone.ntfs partclone.vfat"
+    for dep in $partclone_deps; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing="$missing $dep"
+        fi
+    done
+
     if [ -n "$missing" ]; then
         log_error "Missing dependencies:$missing"
-        log_info "Install with: sudo apt-get install parted partclone pigz pv gdisk efibootmgr ntfs-3g"
+        log_info "Install with: sudo apt-get install parted partclone pigz gdisk util-linux ntfs-3g"
         exit 1
+    fi
+}
+
+disk_dev() {
+    local disk=$1
+    if [[ "$disk" == /dev/* ]]; then
+        echo "$disk"
+    else
+        echo "/dev/$disk"
+    fi
+}
+
+disk_name() {
+    basename "$(disk_dev "$1")"
+}
+
+partition_number() {
+    local partition=$1
+    local part_num
+    part_num=$(lsblk -npo PARTN "$partition" 2>/dev/null | head -1 | tr -d ' ')
+
+    if [ -n "$part_num" ]; then
+        echo "$part_num"
+        return 0
+    fi
+
+    basename "$partition" | sed -E 's/.*[^0-9]([0-9]+)$/\1/'
+}
+
+list_disk_partitions() {
+    local disk=$1
+    local disk_path
+    disk_path=$(disk_dev "$disk")
+
+    lsblk -lnpo NAME,TYPE "$disk_path" 2>/dev/null | awk '$2 == "part" {print $1}'
+}
+
+get_metadata_value() {
+    local key=$1
+    local metadata_file=$2
+
+    [ -f "$metadata_file" ] || return 1
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$metadata_file"
+}
+
+get_backup_boot_mode() {
+    local backup_path=$1
+    local boot_mode
+    boot_mode=$(get_metadata_value "BOOT_MODE" "$backup_path/metadata.txt")
+
+    if [ -n "$boot_mode" ]; then
+        echo "$boot_mode"
+    else
+        detect_boot_mode
+    fi
+}
+
+get_backup_os_type() {
+    local backup_path=$1
+    local os_type
+    os_type=$(get_metadata_value "OS_TYPE" "$backup_path/metadata.txt")
+
+    if [ -n "$os_type" ]; then
+        echo "$os_type"
+    else
+        echo "UNKNOWN"
     fi
 }
 
 list_disks() {
     refresh_disk_list
     log_info "Available disks:"
-    lsblk -d -o NAME,SIZE,MODEL,TYPE | grep disk
+    lsblk -d -o NAME,SIZE,MODEL,SERIAL,TYPE | awk 'NR == 1 || $NF == "disk"'
     echo ""
 }
 
 get_disk_info() {
-    local disk=$1
+    local disk
+    disk=$(disk_name "$1")
     log_info "Disk information for $disk:"
     parted -s "/dev/$disk" print
-    lsblk "/dev/$disk" -o NAME,SIZE,FSTYPE,MOUNTPOINT,LABEL
+    lsblk "/dev/$disk" -o NAME,SIZE,FSTYPE,PARTTYPE,PARTUUID,UUID,MOUNTPOINT,LABEL
 }
 
 is_disk_mounted() {
     local disk=$1
-    if mount | grep -q "^/dev/$disk"; then
-        return 0
-    fi
+    local partition
+
+    while read -r partition; do
+        [ -n "$partition" ] || continue
+        if findmnt -rn -S "$partition" >/dev/null 2>&1; then
+            return 0
+        fi
+    done < <(list_disk_partitions "$disk")
+
     return 1
 }
 
@@ -177,15 +261,16 @@ verify_file_integrity() {
 ################################################################################
 has_windows_partition() {
     local disk=$1
-    local partitions=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep -v "^${disk}$")
+    local partition
 
-    while read -r part_name fs_type; do
-        local partition="/dev/$part_name"
+    while read -r partition; do
+        local fs_type
+        fs_type=$(get_filesystem_type "$partition")
 
         # Check if NTFS partition
         if [ "$fs_type" = "ntfs" ]; then
             # Mount temporarily to check for Windows
-            local temp_mount="/tmp/cyc-check-$$"
+            local temp_mount="/tmp/cyc-check-${BASHPID:-$$}"
             mkdir -p "$temp_mount"
 
             if timeout 10 mount -o ro "$partition" "$temp_mount" 2>/dev/null; then
@@ -200,20 +285,23 @@ has_windows_partition() {
             fi
             rmdir "$temp_mount" 2>/dev/null
         fi
-    done <<< "$partitions"
+    done < <(list_disk_partitions "$disk")
 
     return 1
 }
 
 has_linux_partition() {
     local disk=$1
-    local partitions=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep -v "^${disk}$")
+    local partition
 
-    while read -r part_name fs_type; do
+    while read -r partition; do
+        local fs_type
+        fs_type=$(get_filesystem_type "$partition")
+
         if [[ "$fs_type" =~ ^ext[2-4]$ ]] || [ "$fs_type" = "xfs" ] || [ "$fs_type" = "btrfs" ]; then
             return 0
         fi
-    done <<< "$partitions"
+    done < <(list_disk_partitions "$disk")
 
     return 1
 }
@@ -244,30 +332,39 @@ detect_os_type() {
 
 find_efi_partition() {
     local disk=$1
-    local efi_part=$(lsblk -ln -o NAME,FSTYPE,PARTTYPE "/dev/$disk" | \
-                     grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b\|vfat" | \
-                     head -1 | awk '{print $1}')
+    local partition
+    local fallback=""
 
-    if [ -n "$efi_part" ]; then
-        echo "/dev/$efi_part"
-    else
-        # Fallback: find first vfat partition
-        efi_part=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep vfat | head -1 | awk '{print $1}')
-        if [ -n "$efi_part" ]; then
-            echo "/dev/$efi_part"
+    while read -r partition; do
+        local fs_type part_type
+        fs_type=$(get_filesystem_type "$partition")
+        part_type=$(lsblk -npo PARTTYPE "$partition" 2>/dev/null | head -1)
+
+        part_type=${part_type,,}
+
+        if [[ "$part_type" =~ ^c12a7328-f81f-11d2-ba4b-00a0c93ec93b$ ]]; then
+            echo "$partition"
+            return 0
         fi
-    fi
+
+        if [[ "$fs_type" =~ ^(vfat|fat32|fat16)$ ]] && [ -z "$fallback" ]; then
+            fallback="$partition"
+        fi
+    done < <(list_disk_partitions "$disk")
+
+    [ -n "$fallback" ] && echo "$fallback"
 }
 
 find_windows_partition() {
     local disk=$1
-    local partitions=$(lsblk -ln -o NAME,FSTYPE "/dev/$disk" | grep -v "^${disk}$")
+    local partition
 
-    while read -r part_name fs_type; do
-        local partition="/dev/$part_name"
+    while read -r partition; do
+        local fs_type
+        fs_type=$(get_filesystem_type "$partition")
 
         if [ "$fs_type" = "ntfs" ]; then
-            local temp_mount="/tmp/cyc-check-$$"
+            local temp_mount="/tmp/cyc-check-${BASHPID:-$$}"
             mkdir -p "$temp_mount"
 
             if timeout 10 mount -o ro "$partition" "$temp_mount" 2>/dev/null; then
@@ -281,20 +378,42 @@ find_windows_partition() {
             fi
             rmdir "$temp_mount" 2>/dev/null
         fi
-    done <<< "$partitions"
+    done < <(list_disk_partitions "$disk")
 }
 
 find_linux_root_partition() {
     local disk=$1
+    local partition
+    local fallback=""
 
-    # Try to find root partition (usually largest ext4)
-    local root_part=$(lsblk -ln -o NAME,FSTYPE,SIZE "/dev/$disk" | \
-                      grep -E "ext[2-4]|xfs|btrfs" | \
-                      sort -k3 -hr | head -1 | awk '{print $1}')
+    while read -r partition; do
+        local fs_type
+        fs_type=$(get_filesystem_type "$partition")
 
-    if [ -n "$root_part" ]; then
-        echo "/dev/$root_part"
-    fi
+        if [[ "$fs_type" =~ ^(ext2|ext3|ext4|xfs|btrfs)$ ]]; then
+            local temp_mount="/tmp/cyc-linux-check-${BASHPID:-$$}"
+            mkdir -p "$temp_mount"
+
+            if timeout 10 mount -o ro "$partition" "$temp_mount" 2>/dev/null; then
+                if [ -d "$temp_mount/etc" ] && { [ -d "$temp_mount/boot" ] || [ -d "$temp_mount/usr" ]; }; then
+                    umount "$temp_mount"
+                    rmdir "$temp_mount"
+                    echo "$partition"
+                    return 0
+                fi
+                umount "$temp_mount"
+            fi
+
+            rmdir "$temp_mount" 2>/dev/null
+        fi
+    done < <(list_disk_partitions "$disk")
+
+    # Fallback: choose the largest Linux filesystem partition.
+    fallback=$(lsblk -lnbo NAME,FSTYPE,SIZE "$(disk_dev "$disk")" | \
+        awk '$2 ~ /^(ext2|ext3|ext4|xfs|btrfs)$/ {print $3 " /dev/" $1}' | \
+        sort -nr | head -1 | awk '{print $2}')
+
+    [ -n "$fallback" ] && echo "$fallback"
 }
 
 ################################################################################
@@ -303,18 +422,20 @@ find_linux_root_partition() {
 backup_partition_table() {
     local source_disk=$1
     local backup_path=$2
+    local source_path
+    source_path=$(disk_dev "$source_disk")
 
     log_info "Backing up partition table for $source_disk..."
 
     # Backup MBR/GPT
-    sgdisk --backup="$backup_path/partition-table.sgdisk" "/dev/$source_disk" 2>/dev/null
-    sfdisk -d "/dev/$source_disk" > "$backup_path/partition-table.sfdisk" 2>/dev/null
+    sgdisk --backup="$backup_path/partition-table.sgdisk" "$source_path" 2>/dev/null
+    sfdisk -d "$source_path" > "$backup_path/partition-table.sfdisk" 2>/dev/null
 
     # Backup MBR boot code (first 446 bytes) for Windows BIOS systems
-    dd if="/dev/$source_disk" of="$backup_path/mbr-backup.bin" bs=446 count=1 2>/dev/null
+    dd if="$source_path" of="$backup_path/mbr-backup.bin" bs=446 count=1 2>/dev/null
 
     # Save disk geometry
-    parted -s "/dev/$source_disk" print > "$backup_path/disk-geometry.txt"
+    parted -s "$source_path" print > "$backup_path/disk-geometry.txt"
 
     log_success "Partition table backed up"
 }
@@ -324,10 +445,33 @@ get_filesystem_type() {
     blkid -o value -s TYPE "$partition" 2>/dev/null
 }
 
+partclone_command_for_fs() {
+    local fs_type=$1
+
+    case "$fs_type" in
+        ext2|ext3|ext4)
+            echo "partclone.ext4"
+            ;;
+        ntfs)
+            echo "partclone.ntfs"
+            ;;
+        vfat|fat32|fat16)
+            echo "partclone.vfat"
+            ;;
+        xfs)
+            command -v partclone.xfs >/dev/null 2>&1 && echo "partclone.xfs"
+            ;;
+        btrfs)
+            command -v partclone.btrfs >/dev/null 2>&1 && echo "partclone.btrfs"
+            ;;
+    esac
+}
+
 backup_partition() {
     local partition=$1
     local output_file=$2
     local fs_type=$(get_filesystem_type "$partition")
+    local partclone_cmd
 
     log_info "Backing up $partition (filesystem: $fs_type)..."
 
@@ -338,36 +482,32 @@ backup_partition() {
     fi
 
     case "$fs_type" in
-        ext2|ext3|ext4)
-            log_debug "Using partclone.ext4"
-            if ! partclone.ext4 -c -s "$partition" 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
-                log_error "Failed to backup $partition"
-                return 1
-            fi
-            ;;
-        ntfs)
-            log_debug "Using partclone.ntfs"
-            if ! partclone.ntfs -c -s "$partition" 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
-                log_error "Failed to backup $partition"
-                return 1
-            fi
-            ;;
-        vfat|fat32|fat16)
-            log_debug "Using partclone.vfat"
-            if ! partclone.vfat -c -s "$partition" 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
-                log_error "Failed to backup $partition"
-                return 1
+        ext2|ext3|ext4|ntfs|vfat|fat32|fat16|xfs|btrfs)
+            partclone_cmd=$(partclone_command_for_fs "$fs_type")
+            if [ -n "$partclone_cmd" ]; then
+                log_debug "Using $partclone_cmd"
+                if ! "$partclone_cmd" -c -s "$partition" 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
+                    log_error "Failed to backup $partition"
+                    return 1
+                fi
+            else
+                log_warning "No partclone command for $fs_type, using dd backup..."
+                if ! dd if="$partition" bs=4M status=progress 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
+                    log_error "Failed to backup $partition with dd"
+                    return 1
+                fi
             fi
             ;;
         swap)
             log_info "Skipping swap partition $partition"
             echo "swap" > "${output_file}.type"
+            echo "swap" > "${output_file}.fstype"
             return 0
             ;;
         "")
             log_warning "No filesystem detected on $partition, using dd backup..."
             if ! dd if="$partition" bs=4M status=progress 2>> "$LOG_FILE" | pigz -c > "$output_file"; then
-                log_error "Failed to backup $partition with dd"
+                log_error "Failed to backup $partition"
                 return 1
             fi
             ;;
@@ -393,7 +533,10 @@ backup_partition() {
 }
 
 clone_disk_to_files() {
-    local source_disk=$1
+    local source_disk
+    source_disk=$(disk_name "$1")
+    local source_path
+    source_path=$(disk_dev "$source_disk")
 
     check_root
     check_dependencies
@@ -402,8 +545,8 @@ clone_disk_to_files() {
     log_info "Source disk: $source_disk"
 
     # Verify disk exists
-    if [ ! -b "/dev/$source_disk" ]; then
-        log_error "Disk /dev/$source_disk does not exist"
+    if [ ! -b "$source_path" ]; then
+        log_error "Disk $source_path does not exist"
         exit 1
     fi
 
@@ -418,7 +561,8 @@ clone_disk_to_files() {
     backup_partition_table "$source_disk" "$backup_path"
 
     # Get list of partitions
-    local partitions=$(lsblk -ln -o NAME "/dev/$source_disk" | grep -v "^${source_disk}$")
+    local partitions
+    partitions=$(list_disk_partitions "$source_disk")
 
     if [ -z "$partitions" ]; then
         log_error "No partitions found on $source_disk"
@@ -428,11 +572,10 @@ clone_disk_to_files() {
     local partition_num=1
     local failed=0
     
-    for part_name in $partitions; do
-        local partition="/dev/$part_name"
+    for partition in $partitions; do
 
         # Unmount if mounted
-        if mountpoint -q "$partition" 2>/dev/null || mount | grep -q "$partition"; then
+        if findmnt -rn -S "$partition" >/dev/null 2>&1; then
             log_warning "$partition is mounted, unmounting..."
             umount "$partition" 2>/dev/null || {
                 log_error "Failed to unmount $partition"
@@ -455,10 +598,13 @@ clone_disk_to_files() {
     # Save metadata
     cat > "$backup_path/metadata.txt" << EOF
 SOURCE_DISK=$source_disk
+SOURCE_SIZE_BYTES=$(blockdev --getsize64 "$source_path" 2>/dev/null || echo 0)
+OS_TYPE=$(detect_os_type "$source_disk")
 BACKUP_DATE=$(date)
 BOOT_MODE=$(detect_boot_mode)
 PARTITION_COUNT=$((partition_num - 1))
 FAILED_PARTITIONS=$failed
+BACKUP_FORMAT_VERSION=2
 EOF
 
     if [ $failed -eq 0 ]; then
@@ -478,9 +624,29 @@ EOF
 ################################################################################
 # PARTITION RESTORE FUNCTIONS
 ################################################################################
+validate_target_capacity() {
+    local backup_path=$1
+    local target_disk=$2
+    local source_size target_size
+
+    source_size=$(get_metadata_value "SOURCE_SIZE_BYTES" "$backup_path/metadata.txt")
+    target_size=$(blockdev --getsize64 "$(disk_dev "$target_disk")" 2>/dev/null || echo 0)
+
+    if [ -n "$source_size" ] && [ "$source_size" -gt 0 ] && [ "$target_size" -gt 0 ] && [ "$target_size" -lt "$source_size" ]; then
+        log_error "Target disk $(disk_dev "$target_disk") is smaller than source image"
+        log_error "Source: $source_size bytes, target: $target_size bytes"
+        return 1
+    fi
+
+    return 0
+}
+
 restore_partition_table() {
-    local target_disk=$1
+    local target_disk
+    target_disk=$(disk_name "$1")
     local backup_path=$2
+    local target_path
+    target_path=$(disk_dev "$target_disk")
 
     log_info "Restoring partition table to $target_disk..."
 
@@ -488,41 +654,46 @@ restore_partition_table() {
     log_debug "Wiping existing partition table..."
 
     # Get disk size in sectors
-    local disk_size_sectors=$(blockdev --getsz "/dev/$target_disk" 2>/dev/null)
+    local disk_size_sectors=$(blockdev --getsz "$target_path" 2>/dev/null)
 
     # Wipe with sgdisk (clears GPT)
-    sgdisk --zap-all "/dev/$target_disk" 2>/dev/null || true
+    sgdisk --zap-all "$target_path" 2>/dev/null || true
 
     # Wipe beginning of disk (MBR + GPT primary)
-    dd if=/dev/zero of="/dev/$target_disk" bs=1M count=10 2>/dev/null || true
+    dd if=/dev/zero of="$target_path" bs=1M count=10 2>/dev/null || true
 
     # Wipe end of disk (GPT backup) if we know disk size
-    if [ -n "$disk_size_sectors" ] && [ "$disk_size_sectors" -gt 0 ]; then
+    if [ -n "$disk_size_sectors" ] && [ "$disk_size_sectors" -gt 20480 ]; then
         # Wipe last 10MB where GPT backup resides
-        dd if=/dev/zero of="/dev/$target_disk" bs=1M seek=$((disk_size_sectors / 2048 - 10)) count=10 2>/dev/null || true
+        dd if=/dev/zero of="$target_path" bs=1M seek=$((disk_size_sectors / 2048 - 10)) count=10 2>/dev/null || true
     fi
 
     # Force kernel to re-read empty partition table
-    partprobe "/dev/$target_disk" 2>/dev/null || true
-    blockdev --rereadpt "/dev/$target_disk" 2>/dev/null || true
+    partprobe "$target_path" 2>/dev/null || true
+    blockdev --rereadpt "$target_path" 2>/dev/null || true
 
     sleep 3
 
     # Restore GPT
     if [ -f "$backup_path/partition-table.sgdisk" ]; then
         log_debug "Restoring GPT partition table..."
-        if sgdisk --load-backup="$backup_path/partition-table.sgdisk" "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE"; then
-            sgdisk -G "/dev/$target_disk"  # Randomize GUIDs
+        if sgdisk --load-backup="$backup_path/partition-table.sgdisk" "$target_path" 2>&1 | tee -a "$LOG_FILE"; then
+            if [ "$RANDOMIZE_GPT_GUIDS" = "true" ]; then
+                log_warning "Randomizing GPT GUIDs because RANDOMIZE_GPT_GUIDS=true"
+                sgdisk -G "$target_path"
+            else
+                log_info "Preserving GPT GUIDs for boot compatibility"
+            fi
             log_success "GPT partition table restored"
         else
             log_warning "Failed to restore GPT, trying sfdisk..."
             if [ -f "$backup_path/partition-table.sfdisk" ]; then
-                sfdisk "/dev/$target_disk" < "$backup_path/partition-table.sfdisk" 2>&1 | tee -a "$LOG_FILE"
+                sfdisk "$target_path" < "$backup_path/partition-table.sfdisk" 2>&1 | tee -a "$LOG_FILE"
             fi
         fi
     elif [ -f "$backup_path/partition-table.sfdisk" ]; then
         log_debug "Restoring partition table with sfdisk..."
-        sfdisk "/dev/$target_disk" < "$backup_path/partition-table.sfdisk" 2>&1 | tee -a "$LOG_FILE"
+        sfdisk "$target_path" < "$backup_path/partition-table.sfdisk" 2>&1 | tee -a "$LOG_FILE"
     else
         log_error "No partition table backup found"
         return 1
@@ -530,11 +701,11 @@ restore_partition_table() {
 
     # Inform kernel of partition changes
     log_debug "Informing kernel of partition changes..."
-    partprobe "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE"
+    partprobe "$target_path" 2>&1 | tee -a "$LOG_FILE"
     sleep 3
     
     # Force kernel to re-read partition table
-    blockdev --rereadpt "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE"
+    blockdev --rereadpt "$target_path" 2>&1 | tee -a "$LOG_FILE"
     sleep 2
 
     log_success "Partition table restored"
@@ -545,6 +716,7 @@ restore_partition() {
     local partition=$1
     local input_file=$2
     local fs_type=""
+    local partclone_cmd
 
     # Load filesystem type
     if [ -f "${input_file}.fstype" ]; then
@@ -581,31 +753,24 @@ restore_partition() {
     log_debug "Starting restore operation..."
 
     case "$fs_type" in
-        ext2|ext3|ext4)
-            log_debug "Command: pigz -dc $input_file | partclone.ext4 -r -d -o $partition"
-            if pigz -dc "$input_file" | partclone.ext4 -r -d -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
-                log_success "Successfully restored ext partition"
+        ext2|ext3|ext4|ntfs|vfat|fat32|fat16|xfs|btrfs)
+            partclone_cmd=$(partclone_command_for_fs "$fs_type")
+            if [ -n "$partclone_cmd" ]; then
+                log_debug "Command: pigz -dc $input_file | $partclone_cmd -r -d -o $partition"
+                if pigz -dc "$input_file" | "$partclone_cmd" -r -d -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
+                    log_success "Successfully restored $fs_type partition"
+                else
+                    log_error "Failed to restore $fs_type partition"
+                    return 1
+                fi
             else
-                log_error "Failed to restore ext partition"
-                return 1
-            fi
-            ;;
-        ntfs)
-            log_debug "Command: pigz -dc $input_file | partclone.ntfs -r -d -o $partition"
-            if pigz -dc "$input_file" | partclone.ntfs -r -d -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
-                log_success "Successfully restored NTFS partition"
-            else
-                log_error "Failed to restore NTFS partition"
-                return 1
-            fi
-            ;;
-        vfat|fat32|fat16)
-            log_debug "Command: pigz -dc $input_file | partclone.vfat -r -d -o $partition"
-            if pigz -dc "$input_file" | partclone.vfat -r -d -o "$partition" 2>&1 | tee -a "$LOG_FILE"; then
-                log_success "Successfully restored FAT partition"
-            else
-                log_error "Failed to restore FAT partition"
-                return 1
+                log_info "No partclone command for $fs_type, using dd restore..."
+                if pigz -dc "$input_file" | dd of="$partition" bs=4M status=progress 2>&1 | tee -a "$LOG_FILE"; then
+                    log_success "Successfully restored with dd"
+                else
+                    log_error "Failed to restore with dd"
+                    return 1
+                fi
             fi
             ;;
         "")
@@ -640,7 +805,8 @@ restore_partition() {
 # WINDOWS BOOTLOADER INSTALLATION
 ################################################################################
 install_windows_bootloader_uefi() {
-    local target_disk=$1
+    local target_disk
+    target_disk=$(disk_name "$1")
     local backup_path=$2
 
     log_info "Installing Windows UEFI bootloader on $target_disk..."
@@ -657,7 +823,7 @@ install_windows_bootloader_uefi() {
     log_debug "Windows partition: $win_part"
 
     # Mount EFI partition
-    local efi_mount="/mnt/cyc-efi-$$"
+    local efi_mount="/mnt/cyc-efi-${target_disk}-${BASHPID:-$$}"
     mkdir -p "$efi_mount"
     
     if ! timeout 10 mount "$efi_part" "$efi_mount" 2>&1 | tee -a "$LOG_FILE"; then
@@ -666,65 +832,81 @@ install_windows_bootloader_uefi() {
         return 1
     fi
 
-    # Mount Windows partition
-    local win_mount="/mnt/cyc-win-$$"
-    mkdir -p "$win_mount"
-    
-    if ! timeout 10 mount -t ntfs-3g "$win_part" "$win_mount" 2>&1 | tee -a "$LOG_FILE"; then
-        log_error "Failed to mount Windows partition"
+    local win_mount="/mnt/cyc-win-${target_disk}-${BASHPID:-$$}"
+    local win_mounted=false
+
+    if [ -f "$efi_mount/EFI/Microsoft/Boot/bootmgfw.efi" ]; then
+        log_info "Windows bootloader already exists in EFI partition"
+    else
+        # Mount Windows partition only when the EFI copy needs to be rebuilt.
+        mkdir -p "$win_mount"
+
+        if ! timeout 10 mount -t ntfs-3g -o ro "$win_part" "$win_mount" 2>&1 | tee -a "$LOG_FILE"; then
+            log_error "Failed to mount Windows partition"
+            umount "$efi_mount" 2>/dev/null
+            rmdir "$efi_mount" "$win_mount"
+            return 1
+        fi
+        win_mounted=true
+
+        if [ -d "$win_mount/Windows/Boot" ]; then
+            log_info "Found Windows Boot Manager, copying to EFI partition..."
+
+            mkdir -p "$efi_mount/EFI/Microsoft/Boot"
+
+            if [ -d "$win_mount/Windows/Boot/EFI" ]; then
+                cp -r "$win_mount/Windows/Boot/EFI/"* "$efi_mount/EFI/Microsoft/Boot/" 2>&1 | tee -a "$LOG_FILE" || true
+            fi
+
+            if [ -f "$win_mount/Boot/BCD" ]; then
+                cp "$win_mount/Boot/BCD" "$efi_mount/EFI/Microsoft/Boot/" 2>&1 | tee -a "$LOG_FILE" || true
+            fi
+        else
+            log_warning "Could not find Windows Boot Manager files"
+        fi
+    fi
+
+    # Install the removable UEFI fallback path. This travels with the disk.
+    if [ -f "$efi_mount/EFI/Microsoft/Boot/bootmgfw.efi" ]; then
+        mkdir -p "$efi_mount/EFI/BOOT"
+        cp "$efi_mount/EFI/Microsoft/Boot/bootmgfw.efi" "$efi_mount/EFI/BOOT/BOOTX64.EFI" 2>&1 | tee -a "$LOG_FILE" || true
+        log_success "Windows UEFI fallback installed at EFI/BOOT/BOOTX64.EFI"
+    else
+        log_error "Windows bootmgfw.efi missing after repair attempt"
+        umount "$win_mount" 2>/dev/null
         umount "$efi_mount" 2>/dev/null
-        rmdir "$efi_mount" "$win_mount"
+        rmdir "$win_mount" "$efi_mount" 2>/dev/null || true
         return 1
     fi
 
-    # Check if Windows Boot Manager exists in Windows partition
-    if [ -d "$win_mount/Windows/Boot" ]; then
-        log_info "Found Windows Boot Manager, copying to EFI partition..."
+    # Optional: useful only when this cloned disk should boot in the current host.
+    if [ "$CREATE_EFI_NVRAM_ENTRY" = "true" ] && command -v efibootmgr >/dev/null 2>&1; then
+        local efi_part_num
+        efi_part_num=$(partition_number "$efi_part")
 
-        # Create EFI/Microsoft/Boot directory
-        mkdir -p "$efi_mount/EFI/Microsoft/Boot"
-
-        # Copy bootmgfw.efi and BCD
-        if [ -f "$win_mount/Windows/Boot/EFI/bootmgfw.efi" ]; then
-            cp "$win_mount/Windows/Boot/EFI/bootmgfw.efi" "$efi_mount/EFI/Microsoft/Boot/" 2>&1 | tee -a "$LOG_FILE" || true
-        fi
-
-        if [ -d "$win_mount/Windows/Boot/EFI" ]; then
-            cp -r "$win_mount/Windows/Boot/EFI/"* "$efi_mount/EFI/Microsoft/Boot/" 2>&1 | tee -a "$LOG_FILE" || true
-        fi
-
-        # Copy BCD store
-        if [ -f "$win_mount/Boot/BCD" ]; then
-            cp "$win_mount/Boot/BCD" "$efi_mount/EFI/Microsoft/Boot/" 2>&1 | tee -a "$LOG_FILE" || true
-        fi
-    elif [ -d "$efi_mount/EFI/Microsoft" ]; then
-        log_info "Windows bootloader already exists in EFI partition"
-    else
-        log_warning "Could not find Windows Boot Manager files"
+        log_debug "Creating EFI NVRAM boot entry on this host..."
+        efibootmgr -c -d "/dev/$target_disk" -p "$efi_part_num" \
+                   -L "Windows Boot Manager" \
+                   -l "\\EFI\\Microsoft\\Boot\\bootmgfw.efi" 2>&1 | tee -a "$LOG_FILE" || {
+            log_warning "Could not create EFI boot entry"
+        }
     fi
-
-    # Add EFI boot entry
-    local efi_part_num=$(echo "$efi_part" | sed 's/.*[^0-9]\([0-9]\+\)$/\1/')
-
-    log_debug "Creating EFI boot entry..."
-    efibootmgr -c -d "/dev/$target_disk" -p "$efi_part_num" \
-               -L "Windows Boot Manager" \
-               -l "\\EFI\\Microsoft\\Boot\\bootmgfw.efi" 2>&1 | tee -a "$LOG_FILE" || {
-        log_warning "Could not create EFI boot entry (may not work in current environment)"
-    }
 
     # Cleanup
     sync
-    umount "$win_mount" 2>/dev/null
+    if [ "$win_mounted" = "true" ]; then
+        umount "$win_mount" 2>/dev/null
+    fi
     umount "$efi_mount" 2>/dev/null
-    rmdir "$win_mount" "$efi_mount"
+    rmdir "$win_mount" "$efi_mount" 2>/dev/null || true
 
     log_success "Windows UEFI bootloader installed"
     return 0
 }
 
 install_windows_bootloader_bios() {
-    local target_disk=$1
+    local target_disk
+    target_disk=$(disk_name "$1")
     local backup_path=$2
 
     log_info "Installing Windows BIOS bootloader on $target_disk..."
@@ -760,14 +942,22 @@ install_windows_bootloader_bios() {
 # GRUB INSTALLATION
 ################################################################################
 install_grub() {
-    local target_disk=$1
+    local target_disk
+    target_disk=$(disk_name "$1")
     local backup_path=$2
-    local boot_mode=$(detect_boot_mode)
+    local boot_mode
+    boot_mode=$(get_backup_boot_mode "$backup_path")
+    local grub_failed=0
 
     log_info "Installing GRUB on $target_disk (boot mode: $boot_mode)..."
 
+    if ! command -v grub-install >/dev/null 2>&1; then
+        log_error "grub-install not found. Install GRUB tools for the cloned OS type."
+        return 1
+    fi
+
     # Mount partitions temporarily
-    local mount_point="/mnt/cyc-cloner-$$"
+    local mount_point="/mnt/cyc-cloner-${target_disk}-${BASHPID:-$$}"
     mkdir -p "$mount_point"
 
     # Find root partition (usually the largest ext4)
@@ -803,18 +993,27 @@ install_grub() {
         mount --bind "/$dir" "$mount_point/$dir" 2>&1 | tee -a "$LOG_FILE" || true
     done
 
+    # Enable Windows discovery before generating GRUB config on mixed images.
+    if [ -f "$mount_point/etc/default/grub" ]; then
+        if grep -q "^#*GRUB_DISABLE_OS_PROBER=" "$mount_point/etc/default/grub"; then
+            sed -i 's/^#*GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' "$mount_point/etc/default/grub"
+        else
+            echo "GRUB_DISABLE_OS_PROBER=false" >> "$mount_point/etc/default/grub"
+        fi
+    fi
+
     # Install GRUB
     if [ "$boot_mode" = "UEFI" ]; then
         log_debug "Installing GRUB for UEFI..."
-        chroot "$mount_point" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE" || {
+        chroot "$mount_point" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$GRUB_BOOTLOADER_ID" --no-nvram --removable --recheck "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE" || {
             log_warning "UEFI GRUB installation failed, trying without chroot..."
-            grub-install --target=x86_64-efi --boot-directory="$mount_point/boot" "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE" || true
+            grub-install --target=x86_64-efi --boot-directory="$mount_point/boot" --efi-directory="$mount_point/boot/efi" --bootloader-id="$GRUB_BOOTLOADER_ID" --no-nvram --removable --recheck "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE" || grub_failed=1
         }
     else
         log_debug "Installing GRUB for BIOS..."
         chroot "$mount_point" grub-install "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE" || {
             log_warning "BIOS GRUB installation failed, trying without chroot..."
-            grub-install --boot-directory="$mount_point/boot" "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE" || true
+            grub-install --boot-directory="$mount_point/boot" "/dev/$target_disk" 2>&1 | tee -a "$LOG_FILE" || grub_failed=1
         }
     fi
 
@@ -824,15 +1023,6 @@ install_grub() {
         chroot "$mount_point" grub-mkconfig -o /boot/grub/grub.cfg 2>&1 | tee -a "$LOG_FILE" || true
     }
 
-    # For mixed systems, ensure os-prober is enabled
-    if [ -f "$mount_point/etc/default/grub" ]; then
-        if ! grep -q "GRUB_DISABLE_OS_PROBER=false" "$mount_point/etc/default/grub"; then
-            log_debug "Enabling os-prober for dual-boot detection..."
-            echo "GRUB_DISABLE_OS_PROBER=false" >> "$mount_point/etc/default/grub"
-            chroot "$mount_point" update-grub 2>&1 | tee -a "$LOG_FILE" || true
-        fi
-    fi
-
     # Cleanup
     sync
     for dir in dev/pts dev proc sys boot/efi; do
@@ -840,6 +1030,11 @@ install_grub() {
     done
     umount "$mount_point" 2>/dev/null || true
     rmdir "$mount_point"
+
+    if [ $grub_failed -ne 0 ]; then
+        log_error "GRUB installation failed on $target_disk"
+        return 1
+    fi
 
     log_success "GRUB installed on $target_disk"
     return 0
@@ -849,12 +1044,19 @@ install_grub() {
 # SMART BOOTLOADER INSTALLATION
 ################################################################################
 install_bootloader() {
-    local target_disk=$1
+    local target_disk
+    target_disk=$(disk_name "$1")
     local backup_path=$2
+    local failed=0
 
     log_info "Detecting OS type on $target_disk..."
-    local os_type=$(detect_os_type "$target_disk")
-    local boot_mode=$(detect_boot_mode)
+    local os_type
+    os_type=$(get_backup_os_type "$backup_path")
+    if [ "$os_type" = "UNKNOWN" ]; then
+        os_type=$(detect_os_type "$target_disk")
+    fi
+    local boot_mode
+    boot_mode=$(get_backup_boot_mode "$backup_path")
 
     log_info "Detected OS type: $os_type"
     log_info "Boot mode: $boot_mode"
@@ -863,34 +1065,39 @@ install_bootloader() {
         WINDOWS)
             log_info "Installing Windows-only bootloader..."
             if [ "$boot_mode" = "UEFI" ]; then
-                install_windows_bootloader_uefi "$target_disk" "$backup_path"
+                install_windows_bootloader_uefi "$target_disk" "$backup_path" || failed=1
             else
-                install_windows_bootloader_bios "$target_disk" "$backup_path"
+                install_windows_bootloader_bios "$target_disk" "$backup_path" || failed=1
             fi
             ;;
         LINUX)
             log_info "Installing Linux-only bootloader (GRUB)..."
-            install_grub "$target_disk" "$backup_path"
+            install_grub "$target_disk" "$backup_path" || failed=1
             ;;
         MIXED)
             log_info "Installing bootloader for dual-boot system..."
             # For mixed systems, install GRUB which will detect Windows
-            install_grub "$target_disk" "$backup_path"
+            install_grub "$target_disk" "$backup_path" || failed=1
             # Also ensure Windows bootloader is present in EFI partition
             if [ "$boot_mode" = "UEFI" ]; then
-                install_windows_bootloader_uefi "$target_disk" "$backup_path"
+                install_windows_bootloader_uefi "$target_disk" "$backup_path" || failed=1
             fi
             ;;
         *)
             log_warning "Could not detect OS type, attempting GRUB installation..."
-            install_grub "$target_disk" "$backup_path"
+            install_grub "$target_disk" "$backup_path" || failed=1
             ;;
     esac
+
+    return $failed
 }
 
 restore_to_disk() {
     local backup_path=$1
-    local target_disk=$2
+    local target_disk
+    target_disk=$(disk_name "$2")
+    local target_path
+    target_path=$(disk_dev "$target_disk")
 
     log_info "=== STARTING DISK RESTORE ==="
     log_info "Source: $backup_path"
@@ -909,8 +1116,12 @@ restore_to_disk() {
     fi
 
     # Verify target disk exists
-    if [ ! -b "/dev/$target_disk" ]; then
-        log_error "Target disk /dev/$target_disk does not exist"
+    if [ ! -b "$target_path" ]; then
+        log_error "Target disk $target_path does not exist"
+        return 1
+    fi
+
+    if ! validate_target_capacity "$backup_path" "$target_disk"; then
         return 1
     fi
 
@@ -932,6 +1143,9 @@ restore_to_disk() {
 
     # Restore each partition
     local failed=0
+    local target_partitions
+    target_partitions=$(list_disk_partitions "$target_disk")
+
     for i in $(seq 1 "$partition_count"); do
         local partition_img="$backup_path/partition_${i}.img.gz"
 
@@ -944,7 +1158,8 @@ restore_to_disk() {
         fi
 
         # Get target partition name
-        local target_part=$(lsblk -ln -o NAME "/dev/$target_disk" | grep -v "^${target_disk}$" | sed -n "${i}p")
+        local target_part
+        target_part=$(printf '%s\n' "$target_partitions" | sed -n "${i}p")
 
         if [ -z "$target_part" ]; then
             log_error "Could not find partition $i on $target_disk"
@@ -952,9 +1167,9 @@ restore_to_disk() {
             continue
         fi
 
-        log_info "Restoring partition $i/$partition_count to /dev/$target_part..."
+        log_info "Restoring partition $i/$partition_count to $target_part..."
         
-        if ! restore_partition "/dev/$target_part" "$partition_img"; then
+        if ! restore_partition "$target_part" "$partition_img"; then
             log_error "Failed to restore partition $i"
             ((failed++))
         fi
@@ -968,7 +1183,10 @@ restore_to_disk() {
 
     # Install bootloader (automatically detects OS type)
     log_info "Installing bootloader..."
-    install_bootloader "$target_disk" "$backup_path"
+    if ! install_bootloader "$target_disk" "$backup_path"; then
+        log_error "Bootloader installation failed for $target_disk"
+        return 1
+    fi
 
     # Refresh disk list for hot-swap
     refresh_disk_list
@@ -983,22 +1201,40 @@ restore_to_disk() {
 restore_to_multiple_disks() {
     local backup_path=$1
     shift
-    local target_disks=("$@")
+    local target_disks=()
+    local disk
+
+    for disk in "$@"; do
+        target_disks+=("$(disk_name "$disk")")
+    done
 
     log_info "=== STARTING PARALLEL MULTI-DISK RESTORE ==="
     log_info "Source: $backup_path"
     log_info "Targets: ${target_disks[*]}"
     log_info "Parallel jobs: ${#target_disks[@]}"
 
+    if [ ${#target_disks[@]} -eq 0 ]; then
+        log_error "No target disks specified"
+        return 1
+    fi
+
     # Create array to store PIDs
     local pids=()
-    local disk_status=()
+    local seen=" "
+
+    for disk in "${target_disks[@]}"; do
+        if [[ "$seen" == *" $disk "* ]]; then
+            log_error "Duplicate target disk specified: $disk"
+            return 1
+        fi
+        seen="$seen$disk "
+    done
 
     # Start restore for each disk in parallel
     for disk in "${target_disks[@]}"; do
         (
             # Create separate log for this disk
-            local disk_log="/tmp/cyc-clone-${disk}-$$.log"
+            local disk_log="/tmp/cyc-clone-${disk}-${BASHPID:-$$}.log"
             
             log_info "Starting restore to $disk..." | tee -a "$disk_log"
             
@@ -1012,7 +1248,6 @@ restore_to_multiple_disks() {
         ) &
         
         pids+=($!)
-        disk_status+=("$disk:$!")
 
         log_info "Started restore to $disk (PID: ${pids[-1]})"
 
@@ -1241,10 +1476,49 @@ interactive_restore_multiple() {
     restore_to_multiple_disks "$backup_path" "${target_disks[@]}"
 }
 
+resolve_backup_path() {
+    local backup=$1
+
+    if [ -d "$backup" ]; then
+        echo "$backup"
+    else
+        echo "$BACKUP_DIR/$backup"
+    fi
+}
+
+usage() {
+    cat << EOF
+CycCloner2000
+
+Usage:
+  $0 menu
+  $0 clone <source-disk>
+  $0 restore <backup-name-or-path> <target-disk>
+  $0 restore-many <backup-name-or-path> <target-disk> [target-disk...]
+  $0 list-disks
+  $0 list-backups
+
+Examples:
+  $0 clone sda
+  $0 restore sda_20260513_120000 sdb
+  $0 restore-many sda_20260513_120000 sdb sdc sdd sde sdf
+
+Environment:
+  RANDOMIZE_GPT_GUIDS=true        randomize GPT disk/partition GUIDs after restore
+  CREATE_EFI_NVRAM_ENTRY=true     create EFI NVRAM entry on this host
+  GRUB_BOOTLOADER_ID=GRUB         UEFI GRUB bootloader id
+EOF
+}
+
 ################################################################################
 # MAIN
 ################################################################################
 main() {
+    if [ "${1:-}" = "help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+        usage
+        return 0
+    fi
+
     check_root
     check_dependencies
 
@@ -1256,6 +1530,55 @@ main() {
 
     log_info "CycCloner2000 started"
     log_info "Log file: $LOG_FILE"
+
+    if [ $# -gt 0 ]; then
+        local command=$1
+        shift
+
+        case "$command" in
+            menu)
+                ;;
+            clone)
+                if [ $# -ne 1 ]; then
+                    usage
+                    return 1
+                fi
+                clone_disk_to_files "$1"
+                return $?
+                ;;
+            restore)
+                if [ $# -ne 2 ]; then
+                    usage
+                    return 1
+                fi
+                restore_to_disk "$(resolve_backup_path "$1")" "$2"
+                return $?
+                ;;
+            restore-many|restore-multiple)
+                if [ $# -lt 2 ]; then
+                    usage
+                    return 1
+                fi
+                local backup_path
+                backup_path=$(resolve_backup_path "$1")
+                shift
+                restore_to_multiple_disks "$backup_path" "$@"
+                return $?
+                ;;
+            list-disks)
+                list_disks
+                return $?
+                ;;
+            list-backups)
+                list_backups
+                return $?
+                ;;
+            *)
+                usage
+                return 1
+                ;;
+        esac
+    fi
 
     while true; do
         show_menu
